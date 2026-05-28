@@ -37,7 +37,7 @@ List your key features here (from your code):
 
 ```bash
 git clone https://github.com/yourusername/chesscpp-engine.git
-cd chesscpp-engine
+cd Moth Chess Engine
 mkdir build && cd build
 cmake ..
 cmake --build .
