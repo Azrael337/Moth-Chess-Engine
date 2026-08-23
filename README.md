@@ -21,4 +21,3 @@ Not yet confirm but around 2000-2200 elo
 ## Disservin chess-library
 This chess engine uses https://github.com/Disservin/chess-library for move detections and backened.
 
-[chess.hpp]("https://github.com/Disservin/chess-library")
