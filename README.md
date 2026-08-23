@@ -1,43 +1,24 @@
-# Moth-Chess-Engine
+# Moth chess engine 
+> If Stockfish's nnue is like human brain then Moth's nnue is comparable to stegosaurus's brain, containing only around ~400k parameters.
 
-# ChessCPP Engine
+## Evaluation
+* **Architecture** 716x2 -> 512 -> 64 -> 1
+* Around 400k parameters
 
-[Brief 1-2 sentence description of your engine]
+## Search
+* Alpha-Beta Negamax with fail-soft
+* Reverse Futility Pruning
+* Futility Pruning at depth 1
+* Delta Pruning in qsearch
+* SEE for capture ordering & bad-capture pruning in qsearch
+* LMR
+* Iterative Deepening
+* PVS
 
-A UCI-compliant chess engine written in C++ featuring:
-- Alpha-Beta Negamax with fail-soft
-- Iterative deepening + aspiration windows
-- Quiescence search
-- Transposition table (Zobrist hashing)
-- Null-move pruning & Late Move Reduction
-- Tapered evaluation (MG/EG blending)
+## Play strength
+Not yet confirm but around 2000-2200 elo
 
-## 📊 Estimated Strength
+## Disservin chess-library
+This chess engine uses https://github.com/Disservin/chess-library for move detections and backened.
 
-[Your estimated rating, e.g., "~2200-2400 Elo"]
-
-## 🚀 Features
-
-List your key features here (from your code):
-- Move ordering: hash move, MVV-LVA, killer moves, history heuristic
-- Check extensions
-- Dynamic time management
-- Bishop pair bonus, passed pawn bonuses
-- Isolated & doubled pawn penalties
-- King safety: pawn shield + open-file penalty
-
-## 🔧 Building from Source
-
-### Prerequisites
-- C++17 compiler (g++ or clang)
-- CMake 3.16+ (optional)
-- [chess.hpp](https://github.com/Disservin/chess.hpp) library
-
-### Quick Start
-
-```bash
-git clone https://github.com/yourusername/chesscpp-engine.git
-cd Moth Chess Engine
-mkdir build && cd build
-cmake ..
-cmake --build .
+[chess.hpp]("https://github.com/Disservin/chess-library")
