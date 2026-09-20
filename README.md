@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/Moth_banner.png" alt="Moth chess engine">
+  <img src="Moth_banner.png" alt="Moth chess engine">
 </p>
 
 # Moth Chess Engine
