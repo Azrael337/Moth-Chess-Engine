@@ -1,23 +1,70 @@
-# Moth chess engine 
-> If Stockfish's nnue is like human brain then Moth's nnue is comparable to stegosaurus's brain, containing only around ~400k parameters.
+<p align="center">
+  <img src="assets/Moth_banner.png" alt="Moth chess engine">
+</p>
+
+# Moth Chess Engine
+
+> If Stockfish's NNUE is like a human brain, then Moth's NNUE is comparable to a stegosaurus's brain, containing only around ~400k parameters.
+
+Moth is a lightweight UCI chess engine written in C++ with a focus on efficient search and a compact NNUE evaluation.
 
 ## Evaluation
-* **Architecture** 716x2 -> 512 -> 64 -> 1
-* Around 400k parameters
+
+* **NNUE:** 768 × 2 → 256 → 1
+* **Parameters:** ~400k
+* **Network:** Acherontia
+* Incremental NNUE evaluation
+* Tapered material evaluation
 
 ## Search
+
 * Alpha-Beta Negamax with fail-soft
-* Reverse Futility Pruning
-* Futility Pruning at depth 1
-* Delta Pruning in qsearch
-* SEE for capture ordering & bad-capture pruning in qsearch
-* LMR
+* Principal Variation Search (PVS)
 * Iterative Deepening
-* PVS
+* Transposition Table
+* Late Move Reductions (LMR)
+* Null Move Pruning
+* Reverse Futility Pruning
+* Futility Pruning
+* ProbCut
+* Singular Extensions
+* SEE for capture ordering and pruning
+* Killer Move Heuristic
+* History Heuristic
+* Continuation History
+* Countermove Heuristic
+* Aspiration Windows
+* Quiescence Search
+* Delta Pruning
+* Multi-threaded search
 
-## Play strength
-Not yet confirm but around 2000-2200 elo
+## Play Strength
 
-## Disservin chess-library
-This chess engine uses https://github.com/Disservin/chess-library for move detections and backened.
+Not yet officially tested.
 
+Estimated strength is currently around 2000–2200 Elo.
+
+More testing will be done using engine-vs-engine games.
+
+## Disservin Chess Library
+
+Moth uses the
+[Disservin chess-library](https://github.com/Disservin/chess-library)
+for board representation, legal move generation, and move handling.
+
+## Building
+
+Moth is written in C++ and requires a C++ compiler supporting modern C++ standards.
+
+### Requirements
+
+* C++ compiler
+* CMake / Make (if applicable)
+
+## UCI
+
+Moth supports the Universal Chess Interface (UCI) protocol and can be used with chess GUIs such as Cute Chess.
+
+## License
+
+See [LICENSE](LICENSE).
