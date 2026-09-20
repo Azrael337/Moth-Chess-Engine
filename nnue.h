@@ -1,9 +1,6 @@
-// nnue.h
-// main evaluation code
 #pragma once
 
 #include "chess.hpp"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -19,138 +16,54 @@
 
 namespace nnue {
 
-constexpr int INPUT_DIM = 716;
-constexpr int L1_DIM    = 512;
-constexpr int L2_DIM    = 64;
+constexpr int INPUT_DIM = 768;          // 12 channels (6 piece types x own/enemy) x 64 squares
+constexpr int L1_DIM    = 256;
+constexpr int CONCAT    = 2 * L1_DIM;   // 512 = [stm_acc | nstm_acc]
 
-inline chess::Color flip_color(chess::Color c) {
-    return (c == chess::Color::WHITE) ? chess::Color::BLACK : chess::Color::WHITE;
-}
-
-// ---------------------------------------------------------------------
-// Low-level vector kernels. Each has an AVX2(+FMA) fast path and a plain
-// scalar fallback, so correctness never depends on compiler flags.
-// ---------------------------------------------------------------------
-
-// acc[j] += row[j] for j in [0, n)
-inline void add_row(float* __restrict acc, const float* __restrict row, int n) {
+// ── int16 feature rows widened into int32 accumulators (incremental hot path) ──
+inline void add_row_i16(int32_t* __restrict acc, const int16_t* __restrict row, int n) {
 #if defined(__AVX2__)
     int j = 0;
     for (; j + 8 <= n; j += 8) {
-        __m256 a = _mm256_loadu_ps(acc + j);
-        __m256 r = _mm256_loadu_ps(row + j);
-        _mm256_storeu_ps(acc + j, _mm256_add_ps(a, r));
+        __m128i r16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + j));
+        __m256i r32 = _mm256_cvtepi16_epi32(r16);
+        __m256i a32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + j));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + j), _mm256_add_epi32(a32, r32));
     }
-    for (; j < n; ++j) acc[j] += row[j];
+    for (; j < n; ++j) acc[j] += (int32_t)row[j];
 #else
-    for (int j = 0; j < n; ++j) acc[j] += row[j];
+    for (int j = 0; j < n; ++j) acc[j] += (int32_t)row[j];
 #endif
 }
-
-// acc[k] += v * row[k] for k in [0, n)
-inline void add_scaled_row(float* __restrict acc, const float* __restrict row, float v, int n) {
+inline void sub_row_i16(int32_t* __restrict acc, const int16_t* __restrict row, int n) {
 #if defined(__AVX2__)
-    __m256 vv = _mm256_set1_ps(v);
-    int k = 0;
-    for (; k + 8 <= n; k += 8) {
-        __m256 a = _mm256_loadu_ps(acc + k);
-        __m256 r = _mm256_loadu_ps(row + k);
-#if defined(__FMA__)
-        a = _mm256_fmadd_ps(r, vv, a);
-#else
-        a = _mm256_add_ps(a, _mm256_mul_ps(r, vv));
-#endif
-        _mm256_storeu_ps(acc + k, a);
-    }
-    for (; k < n; ++k) acc[k] += v * row[k];
-#else
-    for (int k = 0; k < n; ++k) acc[k] += v * row[k];
-#endif
-}
-
-// a[j] = clamp(a[j], 0, 1) for j in [0, n)  — the trainer's clipped ReLU
-inline void clip01(float* __restrict a, int n) {
-#if defined(__AVX2__)
-    __m256 zero = _mm256_setzero_ps();
-    __m256 one  = _mm256_set1_ps(1.0f);
     int j = 0;
     for (; j + 8 <= n; j += 8) {
-        __m256 v = _mm256_loadu_ps(a + j);
-        v = _mm256_max_ps(v, zero);
-        v = _mm256_min_ps(v, one);
-        _mm256_storeu_ps(a + j, v);
+        __m128i r16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(row + j));
+        __m256i r32 = _mm256_cvtepi16_epi32(r16);
+        __m256i a32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acc + j));
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(acc + j), _mm256_sub_epi32(a32, r32));
     }
-    for (; j < n; ++j) a[j] = std::min(std::max(a[j], 0.0f), 1.0f);
+    for (; j < n; ++j) acc[j] -= (int32_t)row[j];
 #else
-    for (int j = 0; j < n; ++j) a[j] = std::min(std::max(a[j], 0.0f), 1.0f);
+    for (int j = 0; j < n; ++j) acc[j] -= (int32_t)row[j];
 #endif
 }
 
-// Kept for reference / debugging / tooling — NOT used by evaluate() below,
-// which extracts+accumulates in one bitboard pass instead of materializing
-// this list. Semantics match the original 1:1.
-inline void extract_features(const chess::Board& board, std::vector<int>& out,
-                              chess::Color perspective) {
-    using namespace chess;
-    out.clear();
-    out.reserve(34);
-
-    for (int sqi = 0; sqi < 64; ++sqi) {
-        Square sq(sqi);
-        Piece p = board.at(sq);
-        if (p == Piece::NONE) continue;
-        PieceType pt = p.type();
-        if (pt == PieceType::KING) continue;
-
-        int p_type      = (int)pt;
-        Color pc        = p.color();
-        int feat_sq     = (perspective == Color::WHITE) ? sqi : (sqi ^ 56);
-        int is_enemy    = (pc != perspective) ? 1 : 0;
-        int channel     = is_enemy * 5 + p_type;
-        out.push_back(channel * 64 + feat_sq);
-    }
-
-    Square ksq   = board.kingSq(perspective);
-    int    kfeat = (perspective == Color::WHITE) ? ksq.index() : (ksq.index() ^ 56);
-    out.push_back(640 + kfeat);
-
-    std::string cr = board.getCastleString();
-    bool wk = cr.find('K') != std::string::npos;
-    bool wq = cr.find('Q') != std::string::npos;
-    bool bk = cr.find('k') != std::string::npos;
-    bool bq = cr.find('q') != std::string::npos;
-
-    if (perspective == Color::WHITE) {
-        if (wk) out.push_back(704);
-        if (wq) out.push_back(705);
-        if (bk) out.push_back(706);
-        if (bq) out.push_back(707);
-    } else {
-        if (bk) out.push_back(704);
-        if (bq) out.push_back(705);
-        if (wk) out.push_back(706);
-        if (wq) out.push_back(707);
-    }
-
-    Square ep = board.enpassantSq();
-    if (ep.index() < 64) {
-        int epFile = ep.index() % 8;
-        out.push_back(708 + epFile);
-    }
-}
+struct Accumulator {
+    alignas(32) std::array<int32_t, L1_DIM> white{};
+    alignas(32) std::array<int32_t, L1_DIM> black{};
+};
 
 struct Network {
-    // Feature-major: W1[feature * L1_DIM + neuron] — lets us accumulate by
-    // summing whole rows for each active (sparse) input feature.
-    std::vector<float> W1;
-    std::vector<float> b1;
-    // Input-major: W2[input_neuron * L2_DIM + out_neuron] — the concatenated
-    // 1024-wide layer is dense, so this is a plain matrix multiply, done
-    // as a row-major accumulation (see accumulate_l2 below) for cache
-    // locality and to exploit clipped-ReLU sparsity.
-    std::vector<float> W2;
-    std::vector<float> b2;
-    std::vector<float> W3; // [L2_DIM]
+    // Feature transformer: int16 weights, bias pre-folded into accumulator space
+    std::vector<int16_t> W1;        // [INPUT_DIM][L1_DIM], input-major
+    std::vector<int32_t> b1;        // [L1_DIM], in W1 integer scale
+    float W1_scale     = 1.0f;
+    float W1_inv_scale = 1.0f;
+
+    // Output layer: flat [CONCAT], dequantized to float at load
+    std::vector<float> W2;          // [CONCAT]
     float b3   = 0.0f;
     bool loaded = false;
 
@@ -160,145 +73,151 @@ struct Network {
 
         char magic[8] = {0};
         f.read(magic, 8);
-        if (!f || std::memcmp(magic, "MOTHNNU1", 8) != 0) { loaded = false; return false; }
+        if (!f || std::memcmp(magic, "MOTHTIN1", 8) != 0) { loaded = false; return false; }
 
-        int32_t dims[3] = {0, 0, 0};
+        int32_t dims[4] = {0,0,0,0};
         f.read(reinterpret_cast<char*>(dims), sizeof(dims));
-        if (!f || dims[0] != INPUT_DIM || dims[1] != L1_DIM || dims[2] != L2_DIM) {
-            loaded = false;
-            return false;
-        }
+        if (!f || dims[0] != INPUT_DIM || dims[1] != L1_DIM ||
+            dims[2] != CONCAT  || dims[3] != 1) { loaded = false; return false; }
 
+        f.read(reinterpret_cast<char*>(&W1_scale), sizeof(float));
         W1.resize((size_t)INPUT_DIM * L1_DIM);
+        f.read(reinterpret_cast<char*>(W1.data()), W1.size() * sizeof(int16_t));
+        W1_inv_scale = (W1_scale != 0.0f) ? 1.0f / W1_scale : 1.0f;
+
+        std::vector<float> b1f(L1_DIM);
+        f.read(reinterpret_cast<char*>(b1f.data()), b1f.size() * sizeof(float));
         b1.resize(L1_DIM);
-        W2.resize((size_t)2 * L1_DIM * L2_DIM);
-        b2.resize(L2_DIM);
-        W3.resize(L2_DIM);
+        for (int j = 0; j < L1_DIM; ++j)
+            b1[j] = (int32_t)std::lround((double)b1f[j] * (double)W1_scale);
 
-        f.read(reinterpret_cast<char*>(W1.data()), W1.size() * sizeof(float));
-        f.read(reinterpret_cast<char*>(b1.data()), b1.size() * sizeof(float));
-        f.read(reinterpret_cast<char*>(W2.data()), W2.size() * sizeof(float));
-        f.read(reinterpret_cast<char*>(b2.data()), b2.size() * sizeof(float));
-        f.read(reinterpret_cast<char*>(W3.data()), W3.size() * sizeof(float));
+        float w2s = 1.0f;
+        f.read(reinterpret_cast<char*>(&w2s), sizeof(float));
+        std::vector<int16_t> w2q(CONCAT);
+        f.read(reinterpret_cast<char*>(w2q.data()), w2q.size() * sizeof(int16_t));
+        float inv2 = (w2s != 0.0f) ? 1.0f / w2s : 1.0f;
+        W2.resize(CONCAT);
+        for (int i = 0; i < CONCAT; ++i) W2[i] = (float)w2q[i] * inv2;
+
         f.read(reinterpret_cast<char*>(&b3), sizeof(float));
-
         loaded = (bool)f || f.eof();
         return loaded;
     }
 
-    // Builds one perspective's L1 accumulator directly from the board,
-    // without ever materializing a feature-index list. `wk/wq/bk/bq` and
-    // `epFile` are computed once by the caller and shared between both
-    // perspectives (they don't depend on which perspective we're building).
-    inline void accumulate_perspective(const chess::Board& board, chess::Color perspective,
-                                        bool wk, bool wq, bool bk, bool bq, int epFile,
-                                        std::array<float, L1_DIM>& acc) const {
-        using namespace chess;
+    // Channel layout — must match the trainer exactly:
+    //   own view:  channel = (piece is enemy ? 6 : 0) + piece_type
+    //   white view squares unflipped; black view squares ^ 56
+    inline void toggle_feature(Accumulator& acc, int pt, chess::Color c,
+                               int sq, bool adding) const {
+        const int chW = ((c == chess::Color::BLACK) ? 6 : 0) + pt;
+        const int16_t* rowW = &W1[(size_t)(chW * 64 + sq) * L1_DIM];
 
-        std::copy(b1.begin(), b1.end(), acc.begin());
+        const int chB = ((c == chess::Color::WHITE) ? 6 : 0) + pt;
+        const int16_t* rowB = &W1[(size_t)(chB * 64 + (sq ^ 56)) * L1_DIM];
 
-        static constexpr PieceType PTS[5] = {
-            PieceType::PAWN, PieceType::KNIGHT, PieceType::BISHOP,
-            PieceType::ROOK, PieceType::QUEEN
-        };
-
-        const bool whitePersp = (perspective == Color::WHITE);
-
-        for (int p_type = 0; p_type < 5; ++p_type) {
-            for (int side = 0; side < 2; ++side) {
-                Color pc = (side == 0) ? Color::WHITE : Color::BLACK;
-                Bitboard bb = board.pieces(PTS[p_type], pc);
-                if (bb.empty()) continue;
-
-                int is_enemy = (pc != perspective) ? 1 : 0;
-                int channel  = is_enemy * 5 + p_type;
-                const float* channelBase = &W1[(size_t)channel * 64 * L1_DIM];
-
-                while (bb) {
-                    Square sq = bb.pop(); // extracts + clears the LSB
-                    int sqi = sq.index();
-                    int feat_sq = whitePersp ? sqi : (sqi ^ 56);
-                    add_row(acc.data(), channelBase + (size_t)feat_sq * L1_DIM, L1_DIM);
-                }
-            }
+        if (adding) {
+            add_row_i16(acc.white.data(), rowW, L1_DIM);
+            add_row_i16(acc.black.data(), rowB, L1_DIM);
+        } else {
+            sub_row_i16(acc.white.data(), rowW, L1_DIM);
+            sub_row_i16(acc.black.data(), rowB, L1_DIM);
         }
-
-        // own king
-        {
-            Square ksq   = board.kingSq(perspective);
-            int    kfeat = whitePersp ? ksq.index() : (ksq.index() ^ 56);
-            add_row(acc.data(), &W1[(size_t)(640 + kfeat) * L1_DIM], L1_DIM);
-        }
-
-        // castling rights, own/enemy reordered per perspective (same
-        // semantics as the original: slots are own-KS, own-QS, enemy-KS,
-        // enemy-QS)
-        bool ownKS, ownQS, enemyKS, enemyQS;
-        if (whitePersp) { ownKS = wk; ownQS = wq; enemyKS = bk; enemyQS = bq; }
-        else            { ownKS = bk; ownQS = bq; enemyKS = wk; enemyQS = wq; }
-
-        if (ownKS)   add_row(acc.data(), &W1[(size_t)704 * L1_DIM], L1_DIM);
-        if (ownQS)   add_row(acc.data(), &W1[(size_t)705 * L1_DIM], L1_DIM);
-        if (enemyKS) add_row(acc.data(), &W1[(size_t)706 * L1_DIM], L1_DIM);
-        if (enemyQS) add_row(acc.data(), &W1[(size_t)707 * L1_DIM], L1_DIM);
-
-        // en passant (perspective-independent index)
-        if (epFile >= 0) {
-            add_row(acc.data(), &W1[(size_t)(708 + epFile) * L1_DIM], L1_DIM);
-        }
-
-        clip01(acc.data(), L1_DIM);
     }
 
-    // Returns the evaluation from the side-to-move's perspective, in the
-    // same centipawn-ish scale the training targets used (raw cp, not
-    // normalized) — matches how the rest of the engine's evaluate() works.
-    int evaluate(const chess::Board& board) const {
+    void refresh(const chess::Board& board, Accumulator& acc) const {
         using namespace chess;
+        std::copy(b1.begin(), b1.end(), acc.white.begin());
+        std::copy(b1.begin(), b1.end(), acc.black.begin());
+        Bitboard occ = board.occ();
+        while (occ) {
+            Square sq = Square(occ.pop());
+            Piece p = board.at(sq);
+            if (p == Piece::NONE) continue;
+            toggle_feature(acc, (int)p.type(), p.color(), sq.index(), true);
+        }
+    }
 
-        // Shared, board-global info computed once (was previously
-        // recomputed inside each perspective's extraction).
-        std::string cr = board.getCastleString();
-        bool wk = cr.find('K') != std::string::npos;
-        bool wq = cr.find('Q') != std::string::npos;
-        bool bk = cr.find('k') != std::string::npos;
-        bool bq = cr.find('q') != std::string::npos;
+    // Board is in PRE-move state. Kings are ordinary features here — no special
+    // handling. Castling never reaches this (moth.cpp refreshes on castling).
+    void update_for_move(Accumulator& acc, const chess::Board& board,
+                         const chess::Move& move) const {
+        using namespace chess;
+        Square from = move.from(), to = move.to();
+        Piece moved = board.at(from);
+        if (moved == Piece::NONE) return;
 
-        Square ep = board.enpassantSq();
-        int epFile = (ep.index() < 64) ? (ep.index() % 8) : -1;
+        toggle_feature(acc, (int)moved.type(), moved.color(), from.index(), false);
 
-        alignas(32) std::array<float, L1_DIM> wAcc{}, bAcc{};
-        accumulate_perspective(board, Color::WHITE, wk, wq, bk, bq, epFile, wAcc);
-        accumulate_perspective(board, Color::BLACK, wk, wq, bk, bq, epFile, bAcc);
-
-        alignas(32) std::array<float, 2 * L1_DIM> concat{};
-        bool stmWhite = (board.sideToMove() == Color::WHITE);
-        if (stmWhite) {
-            std::copy(wAcc.begin(), wAcc.end(), concat.begin());
-            std::copy(bAcc.begin(), bAcc.end(), concat.begin() + L1_DIM);
+        if (move.typeOf() == Move::ENPASSANT) {
+            int capSq = to.index() + ((moved.color() == Color::WHITE) ? -8 : 8);
+            toggle_feature(acc, (int)PieceType::PAWN, ~moved.color(), capSq, false);
         } else {
-            std::copy(bAcc.begin(), bAcc.end(), concat.begin());
-            std::copy(wAcc.begin(), wAcc.end(), concat.begin() + L1_DIM);
+            Piece cap = board.at(to);
+            if (cap != Piece::NONE)
+                toggle_feature(acc, (int)cap.type(), cap.color(), to.index(), false);
         }
 
-        // L2: for-m/for-k order gives contiguous 64-float row reads
-        // (vs. the strided k-major/m-minor order), and skips rows whose
-        // input activation is exactly zero (clipped ReLU produces true
-        // zeros often).
-        alignas(32) std::array<float, L2_DIM> hidden;
-        std::copy(b2.begin(), b2.end(), hidden.begin());
+        int destPT = (move.typeOf() == Move::PROMOTION)
+                         ? (int)move.promotionType() : (int)moved.type();
+        toggle_feature(acc, destPT, moved.color(), to.index(), true);
+    }
 
-        for (int m = 0; m < 2 * L1_DIM; ++m) {
-            float v = concat[m];
-            if (v == 0.0f) continue;
-            add_scaled_row(hidden.data(), &W2[(size_t)m * L2_DIM], v, L2_DIM);
-        }
-        clip01(hidden.data(), L2_DIM);
+    // No castling/ep inputs in the 768 layout -> no-op
+    void update_for_null_move(Accumulator& acc, const chess::Board& board) const {
+        (void)acc; (void)board;
+    }
 
+    // Output = single dot: concat([own|nstm] clipped) . W2 + b3
+    int evaluate_from_accumulator(const Accumulator& acc, chess::Color stm) const {
+        const int32_t* own   = (stm == chess::Color::WHITE) ? acc.white.data() : acc.black.data();
+        const int32_t* enemy = (stm == chess::Color::WHITE) ? acc.black.data() : acc.white.data();
+#if defined(__AVX2__)
+        const __m256 inv  = _mm256_set1_ps(W1_inv_scale);
+        const __m256 zero = _mm256_setzero_ps();
+        const __m256 one  = _mm256_set1_ps(1.0f);
+        __m256 sum = _mm256_setzero_ps();
+
+        auto feed = [&](const int32_t* a, const float* w) {
+            for (int j = 0; j < L1_DIM; j += 8) {
+                __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(a + j));
+                __m256 v  = _mm256_mul_ps(_mm256_cvtepi32_ps(q), inv);
+                v = _mm256_max_ps(v, zero);
+                v = _mm256_min_ps(v, one);
+#if defined(__FMA__)
+                sum = _mm256_fmadd_ps(v, _mm256_loadu_ps(w + j), sum);
+#else
+                sum = _mm256_add_ps(sum, _mm256_mul_ps(v, _mm256_loadu_ps(w + j)));
+#endif
+            }
+        };
+        feed(own,   W2.data());
+        feed(enemy, W2.data() + L1_DIM);
+
+        alignas(32) float red[8];
+        _mm256_store_ps(red, sum);
         float out = b3;
-        for (int k = 0; k < L2_DIM; ++k) out += hidden[k] * W3[k];
-
+        for (int k = 0; k < 8; ++k) out += red[k];
         return (int)std::lround(out);
+#else
+        float out = b3;
+        auto feed = [&](const int32_t* a, const float* w) {
+            for (int j = 0; j < L1_DIM; ++j) {
+                float v = (float)a[j] * W1_inv_scale;
+                if (v <= 0.0f) continue;
+                if (v > 1.0f)  v = 1.0f;
+                out += v * w[j];
+            }
+        };
+        feed(own,   W2.data());
+        feed(enemy, W2.data() + L1_DIM);
+        return (int)std::lround(out);
+#endif
+    }
+
+    int evaluate(const chess::Board& board) const {
+        Accumulator acc;
+        refresh(board, acc);
+        return evaluate_from_accumulator(acc, board.sideToMove());
     }
 };
 
